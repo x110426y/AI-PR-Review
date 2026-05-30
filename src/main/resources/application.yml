@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: ai-pr-review
+
+  # ==================== AI 配置 (DeepSeek) ====================
+  ai:
+    openai:
+      api-key: ${DEEPSEEK_API_KEY:YOUR_DEEPSEEK_API}       # DeepSeek API 密钥，通过环境变量注入
+      base-url: https://api.deepseek.com                             # DeepSeek 兼容 OpenAI 接口格式
+      chat:
+        options:
+          model: ${DEEPSEEK_MODEL:deepseek-v4-flash}                     # deepseek-chat (V3) 或 deepseek-reasoner (R1)
+          temperature: 0.3                                            # 较低的温度确保输出更一致、更少"幻觉"
+
+# ==================== GitHub 配置 ====================
+github:
+  token: ${GITHUB_TOKEN:GITHUB_TOKEN}                   # GitHub Personal Access Token，通过环境变量注入
+  api:
+    base-url: https://api.github.com                              # GitHub API 基础地址
+
+# ==================== 服务器配置 ====================
+server:
+  port: 8080
