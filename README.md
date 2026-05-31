@@ -3,7 +3,7 @@
 基于 **Spring Boot 3.2 + Spring AI + Vue 3** 的智能 Pull Request 代码审查助手，已实现 **Hybrid Search（稠密 + 稀疏）+ RRF（倒数排列融合）** 的完整 RAG 架构。前端提供简洁流式界面，后端自动获取 GitHub PR 变更内容，滑动窗口分片后通过虚拟线程并行调用大模型，并通过双路向量检索将团队编码规范动态注入 Prompt，输出贴合团队标准的结构化 Review 报告。
 
 ---
-
+介绍视频链接：https://www.bilibili.com/video/BV1HaVQ6JEUk/?vd_source=a19a6445a521e52d16439f7b045edfa4
 ## 技术栈
 
 | 层级 | 技术 | 版本 | 说明 |
