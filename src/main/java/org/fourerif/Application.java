@@ -4,7 +4,10 @@ import org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStore
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
-@SpringBootApplication(exclude = MilvusVectorStoreAutoConfiguration.class)
+@SpringBootApplication(exclude = {
+        MilvusVectorStoreAutoConfiguration.class,
+        org.springframework.boot.autoconfigure.web.client.RestClientAutoConfiguration.class
+})
 public class Application {
 
     public static void main(String[] args) {
