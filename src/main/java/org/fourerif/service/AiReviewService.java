@@ -8,6 +8,7 @@ import org.springframework.ai.converter.BeanOutputConverter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -81,6 +82,31 @@ public class AiReviewService {
                 result.suggestions() != null ? result.suggestions().size() : 0);
 
         return result;
+    }
+
+    /**
+     * 流式 AI 代码审查 — 逐 Token 返回。
+     * <p>
+     * 与 {@link #review} 使用相同的 Prompt 模板和格式约束，
+     * 但通过 {@code ChatClient.stream().content()} 获取 {@link Flux}，
+     * 由调用方（Controller）通过 SSE 推送给前端，实现打字机效果。
+     *
+     * @param prTitle       PR 标题
+     * @param prDescription PR 描述
+     * @param diffContent   代码 Diff 内容
+     * @return 逐 Token 的字符串流，所有 Token 拼接后为完整 JSON
+     */
+    public Flux<String> reviewStream(String prTitle, String prDescription, String diffContent) {
+        log.info("开始 AI Review 流式分析...");
+
+        BeanOutputConverter<ReviewResult> converter = new BeanOutputConverter<>(ReviewResult.class);
+        String userMessage = buildUserMessage(prTitle, prDescription, diffContent, converter);
+
+        log.info("流式请求已发送，等待模型逐 Token 输出...");
+        return chatClient.prompt()
+                .user(userMessage)
+                .stream()
+                .content();
     }
 
     /**

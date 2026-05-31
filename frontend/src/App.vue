@@ -1,11 +1,20 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 
 // ========== 状态定义 ==========
 const prUrl = ref('')
 const loading = ref(false)
 const error = ref('')
 const result = ref(null)
+const streamText = ref('')        // SSE 累积的原始 JSON 文本
+const streaming = ref(false)      // 是否正在接收 Token
+const startTime = ref(0)          // 流式开始时间戳
+const elapsed = ref(0)            // 已用秒数
+let eventSource = null            // EventSource 实例，用于断开
+let timerInterval = null          // 计时器 interval
+
+// ========== 计算属性 ==========
+const charCount = computed(() => streamText.value.length)
 
 // ========== 常量 ==========
 const API_BASE = 'http://localhost:8080'
@@ -25,13 +34,30 @@ const categoryLabels = {
   STYLE:       '代码风格'
 }
 
-// ========== 核心方法：发起审查 ==========
-async function startReview() {
+// 组件卸载时断开 SSE 连接并清除计时器
+onUnmounted(() => {
+  if (eventSource) eventSource.close()
+  if (timerInterval) clearInterval(timerInterval)
+})
+
+// ========== 核心方法：发起流式审查 ==========
+function startReview() {
   // 清除旧状态
   error.value = ''
   result.value = null
+  streamText.value = ''
+  streaming.value = false
+  startTime.value = 0
+  elapsed.value = 0
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null }
 
-  // 简单校验
+  // 断开上一次连接（如果有）
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+
+  // 前端校验
   const trimmed = prUrl.value.trim()
   if (!trimmed) {
     error.value = '请输入 GitHub PR 链接'
@@ -43,26 +69,54 @@ async function startReview() {
   }
 
   loading.value = true
-  try {
-    const url = `${API_BASE}/api/review?prUrl=${encodeURIComponent(trimmed)}`
-    const resp = await fetch(url)
 
-    if (!resp.ok) {
-      // 尝试解析后端错误消息
-      let msg = `请求失败 (HTTP ${resp.status})`
-      try {
-        const errBody = await resp.json()
-        if (errBody.message) msg = errBody.message
-      } catch (_) { /* ignore */ }
-      throw new Error(msg)
+  // 使用 EventSource 连接 SSE 端点
+  const url = `${API_BASE}/api/review/stream?prUrl=${encodeURIComponent(trimmed)}`
+  eventSource = new EventSource(url)
+
+  // 接收数据块 — 首个 Token 到达时启动计时器
+  eventSource.onmessage = (e) => {
+    if (!streaming.value) {
+      streaming.value = true
+      startTime.value = Date.now()
+      timerInterval = setInterval(() => {
+        elapsed.value = Math.floor((Date.now() - startTime.value) / 1000)
+      }, 200)
     }
+    streamText.value += e.data
+  }
 
-    const data = await resp.json()
-    result.value = data
-  } catch (e) {
-    error.value = e.message || '网络异常，请确认后端服务已启动'
-  } finally {
+  // 流结束 — 停止计时，解析 JSON，渲染结构化卡片
+  eventSource.addEventListener('done', () => {
+    eventSource.close()
+    eventSource = null
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null }
     loading.value = false
+    streaming.value = false
+
+    try {
+      result.value = JSON.parse(streamText.value)
+    } catch (e) {
+      error.value = 'AI 返回数据解析失败，请重试'
+      streamText.value = ''
+    }
+  })
+
+  // 连接异常 / 服务端错误
+  eventSource.onerror = () => {
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null }
+    // 如果还没收到 done 事件，说明是异常中断
+    if (loading.value && !result.value) {
+      loading.value = false
+      streaming.value = false
+      if (!error.value) {
+        error.value = '流式连接中断 — 请确认后端服务已启动且 PR 链接有效'
+      }
+    }
   }
 }
 </script>
@@ -105,14 +159,44 @@ async function startReview() {
       </transition>
     </section>
 
-    <!-- ========== Loading 状态 ========== -->
+    <!-- ========== Loading 状态（GitHub 数据获取阶段） ========== -->
     <transition name="fade">
-      <div v-if="loading" class="loading-card">
+      <div v-if="loading && !streaming" class="loading-card">
         <div class="loading-dots">
           <span></span><span></span><span></span>
         </div>
-        <p>AI 正在分析 PR 变更，请稍候...</p>
-        <p class="loading-hint">大模型推理通常需要 10–30 秒</p>
+        <p>正在获取 PR 变更数据...</p>
+        <p class="loading-hint">正在连接 GitHub API，请稍候</p>
+      </div>
+    </transition>
+
+    <!-- ========== 流式生成进度（不展示原始 JSON） ========== -->
+    <transition name="fade">
+      <div v-if="streaming" class="streaming-card card">
+        <div class="streaming-header">
+          <span class="streaming-indicator"></span>
+          <span>AI 正在生成审查报告…</span>
+        </div>
+
+        <!-- 进度指标 -->
+        <div class="streaming-metrics">
+          <div class="metric-item">
+            <span class="metric-value">{{ charCount }}</span>
+            <span class="metric-label">字符已接收</span>
+          </div>
+          <div class="metric-divider"></div>
+          <div class="metric-item">
+            <span class="metric-value">{{ elapsed }}s</span>
+            <span class="metric-label">已用时间</span>
+          </div>
+        </div>
+
+        <!-- 进度条动画 -->
+        <div class="progress-track">
+          <div class="progress-bar"></div>
+        </div>
+
+        <p class="streaming-hint">报告完成后将自动渲染为结构化卡片</p>
       </div>
     </transition>
 
@@ -345,6 +429,89 @@ async function startReview() {
   margin-top: 6px;
   font-size: 13px;
   color: #a0aec0;
+}
+
+/* ========== 流式进度卡片（隐藏原始 JSON，只展示进度） ========== */
+.streaming-card {
+  border-left: 3px solid #3182ce;
+}
+.streaming-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #2b6cb0;
+}
+.streaming-indicator {
+  width: 10px;
+  height: 10px;
+  background: #3182ce;
+  border-radius: 50%;
+  animation: pulse-dot 1.2s infinite ease-in-out;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+/* 进度指标 */
+.streaming-metrics {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin-bottom: 20px;
+}
+.metric-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 28px;
+}
+.metric-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #1a365d;
+  font-variant-numeric: tabular-nums;
+}
+.metric-label {
+  font-size: 12px;
+  color: #718096;
+  margin-top: 4px;
+}
+.metric-divider {
+  width: 1px;
+  height: 40px;
+  background: #e2e8f0;
+}
+
+/* 无限进度条 */
+.progress-track {
+  height: 4px;
+  background: #edf2f7;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.progress-bar {
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(90deg, #3182ce, #63b3ed, #3182ce);
+  background-size: 200% 100%;
+  border-radius: 2px;
+  animation: progress-slide 1.8s ease-in-out infinite;
+}
+@keyframes progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+.streaming-hint {
+  font-size: 12px;
+  color: #a0aec0;
+  text-align: center;
 }
 
 /* ========== 通用卡片 ========== */
