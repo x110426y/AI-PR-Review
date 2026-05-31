@@ -1,6 +1,6 @@
 # AI PR Review 助手 (全栈)
 
-基于 **Spring Boot 3.2 + Spring AI + Vue 3** 的智能 Pull Request 代码审查助手，现已集成 **RAG（检索增强生成）** 架构。前端提供简洁流式界面，后端自动获取 GitHub PR 变更内容，滑动窗口分片后通过虚拟线程并行调用大模型，并将团队自定义编码规范动态注入 Prompt，输出贴合团队标准的结构化 Review 报告。
+基于 **Spring Boot 3.2 + Spring AI + Vue 3** 的智能 Pull Request 代码审查助手，已实现 **Hybrid Search（稠密 + 稀疏）+ RRF（倒数排列融合）** 的完整 RAG 架构。前端提供简洁流式界面，后端自动获取 GitHub PR 变更内容，滑动窗口分片后通过虚拟线程并行调用大模型，并通过双路向量检索将团队编码规范动态注入 Prompt，输出贴合团队标准的结构化 Review 报告。
 
 ---
 
@@ -13,8 +13,9 @@
 | | Spring AI | 1.0.0 (GA) | `ChatClient` + `BeanOutputConverter` + Milvus 集成 |
 | | Reactor | 3.6+ | `Flux` 流式响应 |
 | **AI Chat** | DeepSeek | V4-Flash | OpenAI 兼容协议 |
-| **AI Embedding** | 硅基流动 (SiliconFlow) | BGE-Large-ZH-v1.5 | 中文优化，1024 维，免费 |
-| **向量数据库** | Milvus | 2.4.0 | 持久化向量检索，AUTOINDEX 索引，COSINE 相似度 |
+| **AI Embedding** | 硅基流动 (SiliconFlow) | BGE-Large-ZH-v1.5 | 稠密向量 (Dense, 1024 维)，中文优化 |
+| **BM25** | 本地 Bigram | — | 稀疏向量 (Sparse)，零依赖纯 Java 实现 |
+| **向量数据库** | Milvus | 2.4.0 | 双向量字段 (Dense + Sparse)，AUTOINDEX + IP 索引，RRF 融合 |
 | **基础设施** | Docker Compose | — | Milvus Standalone (etcd + MinIO + Milvus) |
 | **前端** | Vue 3 | 3.x | Composition API (`<script setup>`) |
 | | Vite | 8.x | 开发服务器 + 构建打包 |
@@ -31,10 +32,11 @@ ai-pr-review/
 ├── README.md
 │
 ├── src/main/java/org/fourerif/
-│   ├── Application.java                 # 启动入口 (禁用 Milvus 自动配置，使用自定义 RagConfig)
+│   ├── Application.java                 # 启动入口 (禁用 Milvus + RestClient 自动配置)
 │   ├── config/
 │   │   ├── WebConfig.java               # 全局 CORS 跨域配置
-│   │   └── RagConfig.java               # RAG 配置: 手动创建 MilvusServiceClient + VectorStore Bean
+│   │   ├── RagConfig.java               # RAG 配置: MilvusClientV2 + Hybrid Collection 初始化
+│   │   └── HttpClientConfig.java        # HTTP 超时配置: OkHttp readTimeout=180s
 │   ├── controller/
 │   │   └── ReviewController.java        # REST + SSE 双端点
 │   │                                    #   GET /api/review        (全量)
@@ -45,10 +47,12 @@ ai-pr-review/
 │   │   └── SuggestionItem.java          # 建议项 (Record)
 │   └── service/
 │       ├── GitHubService.java           # GitHub API + 滑动窗口分片
-│       └── AiReviewService.java         # AI 审查 + RAG 检索 + 虚拟线程并行聚合
+│       ├── SparseVectorService.java     # 本地 BM25: 字符 Bigram 分词 + IDF 索引
+│       ├── MilvusHybridService.java     # Hybrid Schema 管理 + 双路检索 + RRF 融合
+│       └── AiReviewService.java         # AI 审查 + Hybrid RAG + 虚拟线程并行聚合
 │
 ├── src/main/resources/
-│   ├── application.yml                  # Chat (DeepSeek) + Embedding (硅基流动) + Milvus 三合一配置
+│   ├── application.yml                  # Chat (DeepSeek) + Embedding (硅基流动) + Milvus 三合一
 │   ├── prompts/
 │   │   └── review-prompt.st             # AI Prompt 模板 (含 {teamConventions} 占位符)
 │   └── rules/
@@ -176,6 +180,8 @@ cd ai-pr-review
 ./mvnw spring-boot:run
 ```
 
+> **HTTP 超时说明**：OkHttp 默认 readTimeout=10s，对大型 PR Diff 的 AI 审查不够。项目已通过 `HttpClientConfig.java` 将 readTimeout 延长至 **180s**，并排除了 Spring Boot 默认的 `RestClientAutoConfiguration`。如果你的 DeepSeek API 响应特别慢，可在 `HttpClientConfig` 中进一步调大 `readTimeout`。
+
 ### 5. 启动前端
 
 ```bash
@@ -254,7 +260,7 @@ Vue 3 的 Composition API（`<script setup>`）提供了比 Options API 更灵�
 
 | 考量维度 | 选择 | 理由 |
 |----------|------|------|
-| 框架成熟度 | Spring Boot 3.2 + Spring AI 1.0 | Spring Boot 3.2 是稳定大版本，Spring AI 已发布 M6 里程碑，API 趋于稳定 |
+| 框架成熟度 | Spring Boot 3.2 + Spring AI 1.0 | Spring Boot 3.2 LTS + Spring AI 1.0 GA 正式版，API 稳定 |
 | 模型能力 | DeepSeek-V4 | 代码理解能力强，性价比高，支持 OpenAI 兼容协议 |
 | 可替换性 | ChatClient 抽象层 | 更换模型仅需切换 Starter（如 `spring-ai-ollama`），业务代码零改动 |
 | 结构化输出 | BeanOutputConverter | 无需手写 JSON Schema 或复杂正则解析，直接将 JSON 反序列化为 Java Record |
@@ -274,18 +280,19 @@ Vue 3 的 Composition API（`<script setup>`）提供了比 Options API 更灵�
 │  Service 层                                              │
 │  ┌──────────────────┐  ┌──────────────────────────────┐  │
 │  │ GitHubService     │  │ AiReviewService              │  │
-│  │ · URL 解析        │  │ · RAG 检索 (VectorStore)     │  │
+│  │ · URL 解析        │  │ · Hybrid RAG (双路+RRF)      │  │
 │  │ · PR 元数据       │  │ · 单分片流式 (Flux)           │  │
 │  │ · 滑动窗口分片    │  │ · 多分片并行 (虚拟线程×N)     │  │
 │  └──────────────────┘  │ · 结果聚合 + 去重             │  │
 │                         └──────────────────────────────┘  │
 ├─────────────────────────────────────────────────────────┤
-│  RAG 层                                                  │
-│  ┌─────────────────┐  ┌───────────────────────────────┐  │
-│  │ MilvusVectorStore│  │ team-conventions.md            │  │
-│  │ (Milvus 2.4)     │  │ 6大类 / 15条团队强制规范        │  │
-│  │ AUTOINDEX+COSINE │  └───────────────────────────────┘  │
-│  └─────────────────┘                                      │
+│  RAG 层 — Hybrid Search + RRF                            │
+│  ┌───────────────────┐  ┌─────────────────────────────┐  │
+│  │ MilvusHybridService│  │ team-conventions.md          │  │
+│  │ · Dense (1024d)   │  │ 6大类 / 15条团队强制规范      │  │
+│  │ · Sparse (BM25)   │  └─────────────────────────────┘  │
+│  │ · RRF Fusion (k=60)│                                  │
+│  └───────────────────┘                                   │
 ├─────────────────────────────────────────────────────────┤
 │  DTO 层: ReviewResult / RiskItem / Suggestion            │
 ├─────────────────────────────────────────────────────────┤
@@ -293,7 +300,7 @@ Vue 3 的 Composition API（`<script setup>`）提供了比 Options API 更灵�
 └─────────────────────────────────────────────────────────┘
 ```
 
-每一层职责清晰：Controller 负责路由分发（全量 vs 流式），GitHubService 负责 PR 数据获取和滑动窗口分片，AiReviewService 负责 RAG 检索 + AI 调用编排 + 结果聚合去重，RAG 层负责团队规范的知识库管理和相似度检索，DTO 定义前后端数据契约。
+每一层职责清晰：Controller 负责路由分发（全量 vs 流式），GitHubService 负责 PR 数据获取和滑动窗口分片，AiReviewService 负责 Hybrid RAG 检索 + AI 调用编排 + 结果聚合去重，RAG 层负责团队规范的双向量知识库管理 + 双路检索 + RRF 融合排序，SparseVectorService 提供本地 BM25 稀疏向量编码，DTO 定义前后端数据契约。
 
 ---
 
@@ -387,28 +394,62 @@ PR Diff (N Chunks) ─┼─ Virtual Thread #3 ── AI 审查 Chunk 3 ─┼�
 
 ---
 
-### 三、RAG 检索增强生成
+### 三、RAG 检索增强生成 — Hybrid Search + RRF
 
 通用 AI 代码审查最大的局限在于**不理解团队内部规范**。例如 "Controller 禁止直接调用 DAO" 这样的架构约束，通用模型无从知晓，容易将违反团队规范的代码评判为"正常"。RAG 架构通过在 Prompt 中动态注入相关的团队规范，让模型"带着团队眼镜"进行审查。
 
-**RAG 数据流 (`RagConfig` 启动加载 + `AiReviewService.retrieveTeamConventions` 检索 → `buildUserMessage` 注入)：**
+本项目的 RAG 已从**单路稠密检索**升级为**双路 Hybrid Search + RRF（倒数排列融合）**，最大化规范检索的准确率。
+
+**Hybrid RAG 数据流：**
 
 ```
 启动时 (一次性，RagConfig.initVectorStore)：
   team-conventions.md (Markdown, 6大类 / 15条规则)
     → TokenTextSplitter (chunkSize=300 tokens, overlap=50, maxChunks=50)
-      → EmbeddingModel → 硅基流动 BGE-Large-ZH-v1.5 (1024 维向量)
-        → MilvusVectorStore → Milvus Standalone (AUTOINDEX + COSINE, 持久化到 MinIO)
+      → [双向量生成]
+          ├─ Dense:  硅基流动 BGE-Large-ZH-v1.5 → 1024 维 FloatVector
+          └─ Sparse: SparseVectorService (Local BM25 + Char Bigram) → SparseFloatVector
+            → MilvusHybridService → Milvus Standalone (双向量字段, 持久化到 MinIO)
 
-每次审查时 (对每个 Diff Chunk，AiReviewService.retrieveTeamConventions)：
+每次审查时 (对每个 Diff Chunk)：
   Diff Chunk 前 500 字符 (文件路径 + 类名 + 首段代码)
-    → Milvus.similaritySearch(topK=3, metric=COSINE)
-      → 最相关的 3 条团队规范片段
-        → 注入 Prompt {teamConventions} 占位符
-          → ChatClient 审查 (含团队规范约束)
+    → [双路并行检索]
+        ├─ Dense 路:  Embedding → COSINE → ANN Top-K×2
+        └─ Sparse 路: BM25 Bigram → IP (Inner Product) → WAND Top-K×2
+          → RRF Ranker (k=60) 融合排序 → 最终 Top-K 规范
+            → 注入 Prompt {teamConventions} 占位符
+              → ChatClient 审查 (含团队规范约束)
 ```
 
-> **RagConfig 设计说明**：项目通过 `@SpringBootApplication(exclude = MilvusVectorStoreAutoConfiguration.class)` 禁用 Spring AI 自动配置，改为在 `RagConfig` 中手动创建 `MilvusServiceClient` 和 `MilvusVectorStore` Bean。原因是 Spring AI 1.0.0 的自动配置属性命名空间与项目自定义的 `spring.vectorstore.milvus.*` 不一致，手动创建可精确控制连接参数、集合名、维度等关键配置，同时兼容本地无认证的 Milvus Standalone 部署。
+**两路检索的分工与互补：**
+
+| 维度 | Dense 路 (稠密) | Sparse 路 (稀疏) |
+|------|----------------|-------------------|
+| **模型/算法** | BGE-Large-ZH-v1.5 (1024d) | Local BM25 + 字符 Bigram |
+| **相似度度量** | COSINE (余弦相似度) | IP (内积) |
+| **索引类型** | AUTOINDEX | SPARSE_INVERTED_INDEX |
+| **擅长场景** | 语义相似："这个改动看起来像是分层架构问题" | 关键词精确匹配："这段代码包含 `Statement.executeQuery`" |
+| **对规范的覆盖** | 概念级规则（架构分层、异常处理规范） | 术语级规则（SQL注入、空指针、Controller/DAO） |
+
+**为什么选择 RRF (Reciprocal Rank Fusion) 而非加权求和？**
+
+Dense 打分（COSINE, 0~1）和 Sparse 打分（IP, 无上界）的数值尺度差异极大。硬加权需要对两种分数的分布做归一化处理，超参敏感且对不同查询不稳定。RRF 仅依赖排名位置（而非原始分数），天然跨异构检索器可比：
+
+```
+RRF_score(d) = Σ 1 / (k + rank_i(d))
+
+其中 k=60 (标准平滑参数), rank_i(d) 是文档 d 在检索器 i 中的排名
+```
+
+两路各自召回 topK×2 个候选，RRF 重新排序后取最终 Top-K。被两路同时排在前列的文档将获得最高 RRF 分数——这是一种天然的交叉验证机制，有效降低单路检索的噪音。
+
+**RagConfig 设计说明：**
+
+项目同时排除了两个 Spring 自动配置：
+- `MilvusVectorStoreAutoConfiguration` — 因为 Spring AI 的 `MilvusVectorStore` 仅支持单稠密向量字段，无法创建 Hybrid Schema
+- `RestClientAutoConfiguration` — 因为 OkHttp 默认 readTimeout=10s 对 AI Chat API 不够，需用自定义长超时 Builder
+
+`RagConfig` 手动管理 Milvus 的完整生命周期：创建 `MilvusClientV2`（支持 Hybrid Search API）→ 删旧表 → 创建含 Dense + Sparse 双字段的 Collection → 为两个字段分别建索引（AUTOINDEX + SPARSE_INVERTED_INDEX）→ 批量插入 → Load 到内存。
 
 **Query 构造策略 — 为什么取 Diff 前 500 字符？**
 
@@ -421,31 +462,36 @@ diff --git a/UserService.java b/UserService.java    ← 文件路径 → 匹配 
 ```
 
 - **选前 500 字符**：文件路径 + 变更位置 + 首段代码，语义密度最高
-- **不选用完整 Diff**：过长查询被 Embedding 模型截断，稀释关键信号
+- **不选用完整 Diff**：过长查询被 Dense Embedding 模型截断（BGE 最大 512 tokens），且稀释 BM25 的关键词信号
 - **不选用 PR 标题**：缺少代码级语义，"修复 bug" 无法匹配任何规范
 
 **容错降级：**
 
 | 异常场景 | 行为 |
 |----------|------|
-| 向量库为空 / 无匹配 | `retrieveTeamConventions()` 返回 `""` → Prompt 填入 `（无额外团队规范约束，按通用最佳实践审查）` |
-| Embedding 调用失败 | catch 异常，记录 WARN 日志，返回 `""`，**不阻塞审查主流程** |
+| 向量库为空 / 无匹配 | `hybridSearch()` 返回空列表 → 填入 `（无额外团队规范约束，按通用最佳实践审查）` |
+| Sparse 路无命中词表 | 填入哑元维度 `(0, 0.0)` 的稀疏向量，对 RRF 排名无影响，等效退化为 Dense-only |
+| Embedding 调用失败 / Milvus 不可达 | catch 异常，记录 WARN 日志，返回空字符串，**不阻塞审查主流程** |
 | `{teamConventions}` 占位符残留 | 不可能 — 始终有 fallback 文本兜底 |
 
-**技术选型 — 为什么用 Milvus？**
+**技术选型 — 为什么选择这套组合？**
 
-| 考量 | Milvus | SimpleVectorStore (旧) | PgVectorStore / Redis |
+| 考量 | 选择 | 理由 |
+|------|------|------|
+| **向量数据库** | Milvus 2.4 Standalone | 原生支持 SparseFloatVector + hybrid_search + RRF，一条 Docker 命令即可部署 |
+| **稠密模型** | BGE-Large-ZH-v1.5 (硅基流动) | 1024 维中文优化，免费 API，语义理解能力强 |
+| **稀疏算法** | Local BM25 + 字符 Bigram | 零外部依赖，毫秒级，中文混合文本鲁棒，确定性输出 |
+| **融合方法** | RRF (k=60) | 跨异构检索器天然可比，无超参调优，学术验证充分 |
+| **持久化** | MinIO (Docker Volume) | 应用重启无需重新 Embedding，数据零丢失 |
+
+| 考量 | Milvus (当前) | SimpleVectorStore (旧) | PgVectorStore / Redis |
 |------|:---:|:---:|:---:|
 | 部署复杂度 | Docker 一条命令 | 零（JVM 堆内存） | 需额外部署 + 配置 |
 | 数据持久化 | ✅ 自动持久化到 MinIO | ❌ 重启即丢失 | ✅ |
 | 数据规模 | 百万级文档 | < 10,000 条 | 百万级文档 |
-| 检索速度 | AUTOINDEX 索引, < 10ms | 暴力全量, < 1ms | 近似最近邻, < 5ms |
-| 未来扩展 | 原生支持多向量/混合检索/RRF | 不支持 | 取决于实现 |
-
-当前团队规范文件虽小（6 大类 ~15 条规则），但选择 Milvus 作为基础架构是 **面向增长决策**：
-- **持久化**：Milvus 数据存储在 MinIO 中，应用重启无需重新 Embedding
-- **扩展路径清晰**：未来可在当前 Collection 上增加 sparse 向量字段，启用混合检索 + RRF，无需重建数据
-- **运维成本可控**：开发环境 `docker compose up -d` 一条命令即可；生产环境可无缝迁移到 Milvus Cloud / Zilliz Cloud
+| 检索速度 | AUTOINDEX + SPARSE_INVERTED, < 10ms | 暴力全量, < 1ms | 近似最近邻, < 5ms |
+| Hybrid Search | ✅ 原生 SparseFloatVector + RRF | ❌ 不支持 | 取决于实现 |
+| 实际效果 | 双路召回 + RRF 交叉验证, 精准度最高 | 单路 Dense, 关键词匹配弱 | 取决于实现 |
 
 ---
 
@@ -482,20 +528,17 @@ AI 代码审查最大的挑战不是"没发现问题"，而是"发现了不存�
 **1. ✅ 流式输出 (SSE) — 已完成**
 **2. ✅ 滑动窗口 + 重叠分片 + 虚拟线程并行 — 已完成**
 **3. ✅ RAG 检索增强生成 — 已完成**
+**4. ✅ Hybrid Search + RRF (Dense + Sparse) — 已完成**
 
-~~当前 Prompt 中的审查规则是通用型的~~ → 已实现：团队规范 Markdown → `TokenTextSplitter` 切分 → `MilvusVectorStore` (AUTOINDEX + COSINE) + 硅基流动 Embedding 向量化 → Diff Chunk 前 500 字符作为 Query 进行相似度检索 (topK=3) → 动态注入 Prompt `{teamConventions}` 占位符。详见设计思路第三节。
+~~原有单路 Dense 检索~~ → 已升级为：Dense (BGE-Large-ZH, 1024d + COSINE) + Sparse (Local BM25 + 字符 Bigram + IP) 双路并行检索 → Milvus hybrid_search + RRF Ranker (k=60) 融合排序 → Top-3 规范动态注入 Prompt。实测检索耗时 ~150ms，两路交叉验证有效降低单路噪音。详见设计思路第三节。
 
-**4. 语义分片 (AST-aware Chunking)**
+**5. 语义分片 (AST-aware Chunking)**
 
 当前滑动窗口按固定行数机械切分，可能将一个函数截断在两个分片中。未来可引入语言感知的 AST 解析器（如 `tree-sitter`）按函数/类/方法边界智能切分，确保每个分片包含完整的语义单元，进一步提升审查质量。
 
-**5. 历史 Review 学习**
+**6. 历史 Review 学习**
 
 将每次人工采纳/拒绝 AI 建议的反馈记录下来，形成标注数据集。通过 LoRA 微调或 Prompt 中提供 few-shot 示例，让模型学习特定团队的 Review 偏好，逐步降低误报率。
-
-**6. RRF 混合检索 (Reciprocal Rank Fusion)**
-
-当前 RAG 仅使用稠密向量（Dense Embedding）进行语义相似度检索，对特定术语（如 "SQL 注入"、"Controller 层"）的精确匹配不够敏感。Milvus 2.4 原生支持多向量字段（Sparse + Dense），下一步可引入 BM25 稀疏向量检索作为补充，通过 RRF 算法融合两种检索结果，在不损失语义泛化能力的前提下提升对团队规范中关键词的召回精度。
 
 **7. IDE 插件化**
 
