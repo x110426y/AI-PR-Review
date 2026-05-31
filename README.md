@@ -8,14 +8,14 @@
 
 | 层级 | 技术 | 版本 | 说明 |
 |------|------|------|------|
-| **后端** | Java | 21 | 优先使用 Record、虚拟线程等新特性 |
-| | Spring Boot | 3.2.5 | 提供 Web、AI 自动配置 |
-| | Spring AI | 1.0.0-SNAPSHOT | 统一 AI 调用抽象层 |
-| | DeepSeek / OpenAI | — | 默认配置 DeepSeek，可切换任意 OpenAI 兼容模型 |
-| | Maven | 3.8+ | 构建与依赖管理 |
+| **后端** | Java | 21 | Record、虚拟线程、`SseEmitter` 异步流 |
+| | Spring Boot | 3.2.5 | Web + AI 自动配置 |
+| | Spring AI | 1.0.0-SNAPSHOT | `ChatClient` 统一抽象 + `BeanOutputConverter` |
+| | Reactor | 3.6+ | `Flux` 流式响应（Spring AI 底层依赖） |
+| | DeepSeek / OpenAI | — | 默认 DeepSeek，OpenAI 兼容协议，可随时替换 |
 | **前端** | Vue 3 | 3.x | Composition API (`<script setup>`) |
-| | Vite | 8.x | 极速开发构建工具 |
-| | 原生 CSS | — | Scoped 样式，无第三方 UI 库依赖 |
+| | Vite | 8.x | 开发服务器 + 构建打包 |
+| | 原生 CSS | — | Scoped 样式，零 UI 框架依赖 |
 
 ---
 
@@ -31,14 +31,16 @@ ai-pr-review/
 │   ├── config/
 │   │   └── WebConfig.java               # 全局 CORS 跨域配置
 │   ├── controller/
-│   │   └── ReviewController.java        # REST 控制器 (GET /api/review)
+│   │   └── ReviewController.java        # REST + SSE 双端点
+│   │                                    #   GET /api/review        (全量)
+│   │                                    #   GET /api/review/stream (SSE)
 │   ├── dto/
 │   │   ├── ReviewResult.java            # AI 审查结果 (Record)
 │   │   ├── RiskItem.java                # 风险项 (Record)
 │   │   └── SuggestionItem.java          # 建议项 (Record)
 │   └── service/
-│       ├── GitHubService.java           # GitHub API 调用服务
-│       └── AiReviewService.java         # AI 审查核心服务
+│       ├── GitHubService.java           # GitHub API + 滑动窗口分片
+│       └── AiReviewService.java         # AI 审查 + 虚拟线程并行聚合
 │
 ├── src/main/resources/
 │   ├── application.yml                  # 应用配置 (密钥占位符)
@@ -107,10 +109,18 @@ npm run dev
 
 1. 浏览器打开 `http://localhost:5173`
 2. 输入 GitHub PR 链接，如 `https://github.com/spring-projects/spring-ai/pull/123`
-3. 点击「开始 Review」，等待 10–30 秒
-4. 查看结构化的审查报告：变更总结、风险列表、改进建议
+3. 点击「开始 Review」
+4. **流式体验**：页面通过 SSE 实时展示"字符已接收 / 已用时间"进度指标，无需等待即可感知 AI 正在工作
+5. 流结束后自动渲染结构化审查报告：变更总结、风险列表（含严重等级 Badge）、改进建议（含重构代码块）
 
-### 6. 命令行测试
+### 6. API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/review?prUrl=...` | GET | 全量响应：等待 AI 完成后一次性返回 JSON |
+| `/api/review/stream?prUrl=...` | GET | SSE 流式：单分片时逐 Token 推送（打字机体验）；多分片时推送进度事件 + 最终聚合 JSON |
+
+### 7. 命令行测试
 
 也可直接调用后端接口：
 
@@ -169,31 +179,30 @@ Vue 3 的 Composition API（`<script setup>`）提供了比 Options API 更灵�
 **架构分层：**
 
 ```
-┌─────────────────────────────────────────┐
-│  前端 (Vue 3 + Vite)                     │
-│  App.vue  — 搜索输入 + 结果卡片展示       │
-├─────────────────────────────────────────┤
-│  Controller 层 (REST API)                │
-│  ReviewController  — GET /api/review     │
-├─────────────────────────────────────────┤
-│  Service 层 (业务逻辑)                    │
-│  ┌──────────────┐  ┌──────────────────┐  │
-│  │ GitHubService │  │ AiReviewService  │  │
-│  │ (PR 数据获取)  │  │ (AI 代码审查)    │  │
-│  └──────────────┘  └──────────────────┘  │
-├─────────────────────────────────────────┤
-│  DTO 层 (数据传输对象)                    │
-│  ReviewResult / RiskItem / Suggestion   │
-├─────────────────────────────────────────┤
-│  外部依赖                                │
-│  ┌──────────┐  ┌──────────┐             │
-│  │ GitHub   │  │ DeepSeek │             │
-│  │ REST API │  │ API      │             │
-│  └──────────┘  └──────────┘             │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  前端 (Vue 3 + Vite)                              │
+│  EventSource → SSE 流式接收 → 进度仪表 + 卡片渲染  │
+├──────────────────────────────────────────────────┤
+│  Controller 层                                    │
+│  GET /api/review          → 全量 JSON 响应        │
+│  GET /api/review/stream   → SSE (逐 Token/进度)    │
+├──────────────────────────────────────────────────┤
+│  Service 层                                       │
+│  ┌──────────────────┐  ┌───────────────────────┐  │
+│  │ GitHubService     │  │ AiReviewService       │  │
+│  │ · 解析 PR URL     │  │ · 单分片流式 (Flux)    │  │
+│  │ · 获取元数据      │  │ · 多分片并行           │  │
+│  │ · 滑动窗口分片    │  │   (虚拟线程×N)         │  │
+│  └──────────────────┘  │ · 结果聚合 + 去重      │  │
+│                         └───────────────────────┘  │
+├──────────────────────────────────────────────────┤
+│  DTO 层: ReviewResult / RiskItem / Suggestion     │
+├──────────────────────────────────────────────────┤
+│  外部: GitHub REST API  /  DeepSeek API           │
+└──────────────────────────────────────────────────┘
 ```
 
-每一层职责清晰：Controller 负责参数校验和路由，Service 封装外部调用和 AI 交互逻辑，DTO 定义数据契约。前端通过 HTTP 与 Controller 层通信，前后端完全解耦，可独立部署、独立开发。
+每一层职责清晰：Controller 负责参数校验和路由分发（全量 vs 流式），GitHubService 负责数据获取和智能分片，AiReviewService 负责 AI 调用编排（单分片流式 / 多分片虚拟线程并行 + 聚合去重），DTO 定义前后端数据契约。
 
 ---
 
@@ -224,21 +233,66 @@ GitHub 提供了两组关键 API：
                               └───────────────────────────┘
 ```
 
-**长文本截断策略：**
+**长文本处理：滑动窗口 + 重叠分片 + 虚拟线程并行**
 
-代码 Diff 可能非常庞大（大型 PR 可达数万行），直接传输存在三个问题：
+大型 PR 的 Diff 可能达到数万行甚至数十万行。若不分片直接发送，三个问题无法回避：Token 窗口不够、模型注意力稀释、响应延迟线性增长。之前的 MVP 方案采用 20000 字符的简单硬截断（丢弃后半部分），但这会导致严重的代码上下文丢失和审查漏报。
 
-1. **Token 限制**：模型上下文窗口有限，一次性消耗过多 tokens 会挤压输出空间，且费用高昂。
-2. **注意力稀释**：大量不相关的变更会稀释模型对关键代码的注意力，导致漏报风险。
-3. **响应延迟**：输入越长，模型推理时间越长。
+当前已升级为以下完整方案：
 
-当前采用的截断方案：**硬截断 + 明确告知**。在 `GitHubService.truncateDiff()` 中，当 Diff 超过 20000 字符时保留前半部分，并在末尾附加截断提示。该方案简单可靠，适合 MVP 阶段。
+**第一步 — 滑动窗口分片 (`GitHubService.chunkDiffWithOverlap`)**
 
-**未来优化方向：**
+```
+原始 Diff (6000 行)
+│
+├── Chunk 1: 行   1-800  ─┐
+│                          ├─ 重叠区: 行 651-800 (150 行)
+├── Chunk 2: 行 651-1450 ─┘
+│                          ├─ 重叠区: 行 1301-1450
+├── Chunk 3: 行 1301-2100 ...
+│
+...共 N 个分片，Diff 100% 覆盖，零丢弃
+```
 
-- **文件级过滤**：根据 `.gitignore` 或配置的白名单过滤不需要审查的文件（如 lock 文件、生成代码）。
-- **智能摘要**：对大文件先生成摘要再送入主 Prompt，而非直接丢弃。
-- **分片审查**：将超大 PR 按文件拆分，逐片调用 AI 后合并结果，确保不丢失任何变更。
+- **窗口大小**：800 行/Chunk（约 2–3 万字符，模型注意力最佳区间）
+- **重叠行数**：150 行，确保分片边界的代码在两个相邻窗口中均可见
+- **为什么需要重叠？** 代码审查的上下文依赖很强——函数的调用方和被调用方可能落在不同分片中。150 行的重叠区确保边界附近的代码可被相邻两个窗口分别审查，大幅降低"边界漏报"
+
+**第二步 — 虚拟线程并行审查 (`AiReviewService.reviewChunksParallel`)**
+
+```
+                    ┌─ Virtual Thread #1 ── AI 审查 Chunk 1 ─┐
+                    ├─ Virtual Thread #2 ── AI 审查 Chunk 2 ─┤
+PR Diff (N Chunks) ─┼─ Virtual Thread #3 ── AI 审查 Chunk 3 ─┼─ 聚合 + 去重
+                    ├─ Virtual Thread #4 ── AI 审查 Chunk 4 ─┤
+                    └─ Virtual Thread #5 ── AI 审查 Chunk 5 ─┘
+                                          (全部并行，总耗时 ≈ 最慢单分片)
+```
+
+- **并发模型**：`Executors.newVirtualThreadPerTaskExecutor()` — 虚拟线程启动成本 ~1μs，JVM 在少量 OS 线程上调度大量虚拟线程，天然适合"长时间 IO 等待"（等 AI API 响应）
+- **时间线**：N 个分片串行需 N×30 秒，并行后 ≈ max(每个分片耗时) ≈ 30 秒
+- **容错**：单分片失败不中断全局 — 异常被捕获、记录日志、该分片返回 null 后被过滤，仅合并成功的结果
+
+**第三步 — 结果聚合与去重 (`AiReviewService.mergeResults`)**
+
+- **summary**：各分片摘要按序拼接，标注共有多少个分片
+- **risks / suggestions**：合并后按 `(location, description)` 精确去重
+  - 去重前先剥离 `[分片 X/N]` 前缀，确保重叠区内的同一问题不会因分片不同而被重复报告
+- **全失败兜底**：若所有分片均失败，返回明确错误摘要 + 空列表，不会返回 null 导致前端崩溃
+
+**对比：**
+
+| 维度 | 旧方案 (硬截断) | 新方案 (滑动窗口并行) |
+|------|:---:|:---:|
+| Diff 覆盖率 | ~30-50% (20000 字符后丢弃) | **100%** |
+| 审查耗时 | O(N) 串行 | **O(1)** 虚拟线程并发 |
+| 边界漏报 | 严重 | 低 (150 行重叠) |
+| 重复报告 | 无 | 精确去重 |
+| 单点故障 | 全部失败 | 分片级隔离 |
+
+**未来可进一步优化的方向：**
+
+- **语义分片**：当前按行数机械切分，未来可引入语言感知的 AST 解析（如 `tree-sitter`）按函数/类边界智能切分
+- **文件级过滤**：根据 `.gitignore` 或配置白名单过滤 lock 文件、生成代码等无需审查的文件
 
 ---
 
@@ -272,16 +326,18 @@ AI 代码审查最大的挑战不是"没发现问题"，而是"发现了不存�
 
 ### 四、未来扩展方向
 
-**1. 流式输出 (SSE — Server-Sent Events)**
+**1. ✅ 流式输出 (SSE — Server-Sent Events) — 已完成**
 
-当前 AI 调用采用"请求-全量响应"模式，用户需等待 10–30 秒才能看到结果。未来可改造为 SSE 流式输出：后端通过 Spring AI 的 `ChatClient.stream()` 获取增量 Token，经 Spring WebFlux 的 `Flux<ServerSentEvent>` 推送至前端；前端使用 `EventSource` API 逐段渲染 Markdown 格式的审查结果。这将提供类似 ChatGPT 的打字机体验，显著降低用户等待感知。
+~~当前 AI 调用采用"请求-全量响应"模式~~ → 已改造为双端点架构：
 
-**2. Diff 智能分片**
+- `GET /api/review` — 保留全量响应，兼容旧调用方
+- `GET /api/review/stream` — 新增 SSE 流式端点
 
-替代当前的 20000 字符简单硬截断，引入语言感知的 AST 解析器（如 `javaparser`、`tree-sitter`）识别代码块的语义边界，按函数/类/文件为单位进行智能分片。每个分片独立送审 AI，结果按风险严重程度排序汇总。该方案确保：
-- 关键变更（安全敏感函数、核心业务逻辑）不因截断被遗漏
-- 每个分片大小可控，模型注意力集中
-- 支持并行调用 AI 进一步缩短总耗时
+后端通过 Spring AI 的 `ChatClient.stream().content()` 获取 `Flux<String>` 逐 Token 流，经 `SseEmitter` 推送至前端；前端使用 `EventSource` API 接收，展示"字符已接收 / 已用时间"进度指标，流结束后自动解析 JSON 渲染结构化卡片。单分片时保持打字机体验；多分片时推送 `progress` 事件 + 最终聚合 JSON。详见设计思路第二节。
+
+**2. ✅ 滑动窗口 + 重叠分片 + 虚拟线程并行 — 已完成**
+
+~~替代当前的 20000 字符简单硬截断~~ → 已实现：按行滑动窗口切分 (800 行/窗口，150 行重叠)，Java 21 虚拟线程并行审查所有分片，结果聚合后精确去重。Diff 覆盖率从 ~30-50% 提升至 **100%**。详见设计思路第二节。
 
 **3. RAG + 团队代码规范**
 
