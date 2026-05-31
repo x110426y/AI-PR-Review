@@ -10,10 +10,12 @@
 |------|------|------|------|
 | **后端** | Java | 21 | Record、虚拟线程、`SseEmitter` 异步流 |
 | | Spring Boot | 3.2.5 | Web + AI 自动配置 |
-| | Spring AI | 1.0.0-M5 | `ChatClient` 统一抽象 + `BeanOutputConverter` + `SimpleVectorStore` |
-| | Reactor | 3.6+ | `Flux` 流式响应（Spring AI 底层依赖） |
-| **AI Chat** | DeepSeek | V4-Flash | OpenAI 兼容协议，可替换为 GPT-4o / Qwen 等 |
-| **AI Embedding** | 硅基流动 (SiliconFlow) | BGE-Large-ZH-v1.5 | 中文优化，1024 维，免费额度 |
+| | Spring AI | 1.0.0 (GA) | `ChatClient` + `BeanOutputConverter` + Milvus 集成 |
+| | Reactor | 3.6+ | `Flux` 流式响应 |
+| **AI Chat** | DeepSeek | V4-Flash | OpenAI 兼容协议 |
+| **AI Embedding** | 硅基流动 (SiliconFlow) | BGE-Large-ZH-v1.5 | 中文优化，1024 维，免费 |
+| **向量数据库** | Milvus | 2.4.0 | 持久化向量检索，AUTOINDEX 索引，COSINE 相似度 |
+| **基础设施** | Docker Compose | — | Milvus Standalone (etcd + MinIO + Milvus) |
 | **前端** | Vue 3 | 3.x | Composition API (`<script setup>`) |
 | | Vite | 8.x | 开发服务器 + 构建打包 |
 | | 原生 CSS | — | Scoped 样式，零 UI 框架依赖 |
@@ -24,14 +26,15 @@
 
 ```
 ai-pr-review/
-├── pom.xml                              # Maven 构建配置
+├── pom.xml                              # Maven 构建配置 (Spring AI 1.0.0 GA + Milvus Starter)
+├── docker-compose.yml                   # Milvus Standalone (etcd + MinIO + Milvus)
 ├── README.md
 │
 ├── src/main/java/org/fourerif/
-│   ├── Application.java                 # Spring Boot 启动入口
+│   ├── Application.java                 # 启动入口 (禁用 Milvus 自动配置，使用自定义 RagConfig)
 │   ├── config/
 │   │   ├── WebConfig.java               # 全局 CORS 跨域配置
-│   │   └── RagConfig.java               # RAG 配置: SimpleVectorStore + 规范文件加载
+│   │   └── RagConfig.java               # RAG 配置: 手动创建 MilvusServiceClient + VectorStore Bean
 │   ├── controller/
 │   │   └── ReviewController.java        # REST + SSE 双端点
 │   │                                    #   GET /api/review        (全量)
@@ -45,11 +48,11 @@ ai-pr-review/
 │       └── AiReviewService.java         # AI 审查 + RAG 检索 + 虚拟线程并行聚合
 │
 ├── src/main/resources/
-│   ├── application.yml                  # Chat (DeepSeek) + Embedding (硅基流动) 双配置
+│   ├── application.yml                  # Chat (DeepSeek) + Embedding (硅基流动) + Milvus 三合一配置
 │   ├── prompts/
 │   │   └── review-prompt.st             # AI Prompt 模板 (含 {teamConventions} 占位符)
 │   └── rules/
-│       └── team-conventions.md          # 团队编码规范 (RAG 知识库)
+│       └── team-conventions.md          # 团队编码规范 (RAG 知识库，6大类15条强制规则)
 │
 └── frontend/                            # 前端工程 (Vue 3 + Vite)
     ├── index.html
@@ -57,7 +60,7 @@ ai-pr-review/
     ├── vite.config.js
     └── src/
         ├── main.js                      # Vue 应用入口
-        └── App.vue                      # 核心页面（搜索 + 结果展示）
+        └── App.vue                      # 核心页面（搜索 + 流式结果展示）
 ```
 
 ---
@@ -66,7 +69,7 @@ ai-pr-review/
 
 ### 1. 环境准备
 
-- **后端**: JDK 21+、Maven 3.8+
+- **后端**: JDK 21+、Maven 3.8+、Docker Desktop
 - **前端**: Node.js 18+、npm 9+
 - **外部服务**:
   - GitHub Personal Access Token — 用于调用 GitHub API
@@ -86,13 +89,81 @@ export SILICONFLOW_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 
 # GitHub API
 export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+
+# Milvus 向量数据库 (本地 Docker，默认值通常无需修改)
+export MILVUS_URI="http://localhost:19530"       # Milvus gRPC 连接地址
+export MILVUS_DATABASE="default"                 # 数据库名
+export MILVUS_COLLECTION="team_conventions"      # 集合名
 ```
 
 > **为什么分开两个 AI 提供商？** DeepSeek 负责代码审查（Chat），性价比极高；硅基流动的 `BAAI/bge-large-zh-v1.5` 免费且中文 Embedding 效果最好。两者在 `application.yml` 中通过 `spring.ai.openai.embedding` 子节点独立配置 `api-key` 和 `base-url`，互不干扰。
 >
 > 如果不想启用 RAG，只需删除 `src/main/resources/rules/team-conventions.md` 即可 — 系统会自动降级为通用审查模式。
+>
+> **完整配置参考**（`application.yml` 核心片段）：
+>
+> ```yaml
+> spring:
+>   ai:
+>     openai:
+>       api-key: ${DEEPSEEK_API_KEY}              # DeepSeek Chat
+>       base-url: https://api.deepseek.com
+>       chat:
+>         options:
+>           model: deepseek-v4-flash
+>           temperature: 0.3
+>       embedding:                                 # 硅基流动 Embedding (独立配置)
+>         api-key: ${SILICONFLOW_API_KEY}
+>         base-url: https://api.siliconflow.cn
+>         options:
+>           model: BAAI/bge-large-zh-v1.5          # 1024 维中文向量
+>
+>   vectorstore:
+>     milvus:                                      # 本地 Milvus Standalone
+>       database-name: ${MILVUS_DATABASE:default}
+>       collection-name: ${MILVUS_COLLECTION:team_conventions}
+>       embedding-dimension: 1024
+>       metric-type: COSINE
+>       index-type: AUTOINDEX
+>       initialize-schema: true
+>       uri: ${MILVUS_URI:http://localhost:19530}
+> ```
 
-### 3. 启动后端
+### 3. 启动 Milvus 向量数据库
+
+项目根目录已包含 `docker-compose.yml`，一键启动 Milvus Standalone：
+
+```bash
+cd ai-pr-review
+docker compose up -d     # 启动 etcd + MinIO + Milvus Standalone
+```
+
+**验证所有容器正常运行：**
+
+```bash
+# 检查容器状态（3 个容器均应为 Up / healthy）
+docker compose ps
+
+# 健康检查端点
+curl http://localhost:9091/healthz
+# → OK
+```
+
+**端口说明：**
+
+| 端口 | 服务 | 用途 |
+|------|------|------|
+| `19530` | Milvus gRPC / HTTP | 应用连接（向量写入 + 相似度检索） |
+| `9091` | Milvus Metrics | 健康检查 / Prometheus 指标 |
+| `9001` | MinIO Console | 对象存储管理界面（可选） |
+
+> 首次启动需要拉取 `milvusdb/milvus:v2.4.0`、`minio/minio`、`quay.io/coreos/etcd:v3.5.5` 三个镜像，约 2–5 分钟。Milvus 启动后约 30 秒完成内部初始化（etcd 选主 + MinIO bucket 创建）。
+>
+> **数据持久化**：三个 Docker Volume（`etcd_data`、`minio_data`、`milvus_data`）确保重启后数据不丢失。如需彻底清理：`docker compose down -v`。
+>
+> **内存占用**：Milvus Standalone 默认约 1–2 GB，可在 Docker Desktop 中调整 `mem_limit`。
+
+### 4. 启动后端
 
 ```bash
 # 进入项目根目录
@@ -105,7 +176,7 @@ cd ai-pr-review
 ./mvnw spring-boot:run
 ```
 
-### 4. 启动前端
+### 5. 启动前端
 
 ```bash
 # 进入前端目录
@@ -118,7 +189,7 @@ npm install
 npm run dev
 ```
 
-### 5. 使用
+### 6. 使用
 
 1. 浏览器打开 `http://localhost:5173`
 2. 输入 GitHub PR 链接，如 `https://github.com/spring-projects/spring-ai/pull/123`
@@ -126,14 +197,14 @@ npm run dev
 4. **流式体验**：页面通过 SSE 实时展示"字符已接收 / 已用时间"进度指标，无需等待即可感知 AI 正在工作
 5. 流结束后自动渲染结构化审查报告：变更总结、风险列表（含严重等级 Badge）、改进建议（含重构代码块）
 
-### 6. API 端点
+### 7. API 端点
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/review?prUrl=...` | GET | 全量响应：等待 AI 完成后一次性返回 JSON |
 | `/api/review/stream?prUrl=...` | GET | SSE 流式：单分片时逐 Token 推送（打字机体验）；多分片时推送进度事件 + 最终聚合 JSON |
 
-### 7. 命令行测试
+### 8. 命令行测试
 
 也可直接调用后端接口：
 
@@ -211,13 +282,14 @@ Vue 3 的 Composition API（`<script setup>`）提供了比 Options API 更灵�
 ├─────────────────────────────────────────────────────────┤
 │  RAG 层                                                  │
 │  ┌─────────────────┐  ┌───────────────────────────────┐  │
-│  │ SimpleVectorStore│  │ team-conventions.md            │  │
-│  │ (内存向量索引)    │  │ 6大类 / 15条团队强制规范        │  │
-│  └─────────────────┘  └───────────────────────────────┘  │
+│  │ MilvusVectorStore│  │ team-conventions.md            │  │
+│  │ (Milvus 2.4)     │  │ 6大类 / 15条团队强制规范        │  │
+│  │ AUTOINDEX+COSINE │  └───────────────────────────────┘  │
+│  └─────────────────┘                                      │
 ├─────────────────────────────────────────────────────────┤
 │  DTO 层: ReviewResult / RiskItem / Suggestion            │
 ├─────────────────────────────────────────────────────────┤
-│  外部: GitHub API  │  DeepSeek (Chat)  │  硅基流动 (Embedding) │
+│ 外部: GitHub API │ DeepSeek (Chat) │ 硅基流动 (Embedding) │ Milvus (向量库) │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -319,22 +391,24 @@ PR Diff (N Chunks) ─┼─ Virtual Thread #3 ── AI 审查 Chunk 3 ─┼�
 
 通用 AI 代码审查最大的局限在于**不理解团队内部规范**。例如 "Controller 禁止直接调用 DAO" 这样的架构约束，通用模型无从知晓，容易将违反团队规范的代码评判为"正常"。RAG 架构通过在 Prompt 中动态注入相关的团队规范，让模型"带着团队眼镜"进行审查。
 
-**RAG 数据流 (`AiReviewService.retrieveTeamConventions` → `buildUserMessage`)：**
+**RAG 数据流 (`RagConfig` 启动加载 + `AiReviewService.retrieveTeamConventions` 检索 → `buildUserMessage` 注入)：**
 
 ```
-启动时 (一次性)：
-  team-conventions.md (Markdown)
-    → TokenTextSplitter (按语义段落切分, ~300 tokens/chunk)
-      → EmbeddingModel → 硅基流动 BGE-Large-ZH-v1.5 (向量化)
-        → SimpleVectorStore (JVM 内存索引, 无外部依赖)
+启动时 (一次性，RagConfig.initVectorStore)：
+  team-conventions.md (Markdown, 6大类 / 15条规则)
+    → TokenTextSplitter (chunkSize=300 tokens, overlap=50, maxChunks=50)
+      → EmbeddingModel → 硅基流动 BGE-Large-ZH-v1.5 (1024 维向量)
+        → MilvusVectorStore → Milvus Standalone (AUTOINDEX + COSINE, 持久化到 MinIO)
 
-每次审查时 (对每个 Diff Chunk)：
-  Diff Chunk 前 500 字符 (文件路径 + 类名 + 代码片段)
-    → VectorStore.similaritySearch(topK=3)
-      → 最相关的 3 条团队规范
+每次审查时 (对每个 Diff Chunk，AiReviewService.retrieveTeamConventions)：
+  Diff Chunk 前 500 字符 (文件路径 + 类名 + 首段代码)
+    → Milvus.similaritySearch(topK=3, metric=COSINE)
+      → 最相关的 3 条团队规范片段
         → 注入 Prompt {teamConventions} 占位符
           → ChatClient 审查 (含团队规范约束)
 ```
+
+> **RagConfig 设计说明**：项目通过 `@SpringBootApplication(exclude = MilvusVectorStoreAutoConfiguration.class)` 禁用 Spring AI 自动配置，改为在 `RagConfig` 中手动创建 `MilvusServiceClient` 和 `MilvusVectorStore` Bean。原因是 Spring AI 1.0.0 的自动配置属性命名空间与项目自定义的 `spring.vectorstore.milvus.*` 不一致，手动创建可精确控制连接参数、集合名、维度等关键配置，同时兼容本地无认证的 Milvus Standalone 部署。
 
 **Query 构造策略 — 为什么取 Diff 前 500 字符？**
 
@@ -358,16 +432,20 @@ diff --git a/UserService.java b/UserService.java    ← 文件路径 → 匹配 
 | Embedding 调用失败 | catch 异常，记录 WARN 日志，返回 `""`，**不阻塞审查主流程** |
 | `{teamConventions}` 占位符残留 | 不可能 — 始终有 fallback 文本兜底 |
 
-**技术选型 — 为什么用 SimpleVectorStore 而非 Milvus/pgvector？**
+**技术选型 — 为什么用 Milvus？**
 
-| 考量 | SimpleVectorStore | PgVectorStore / Redis |
-|------|:---:|:---:|
-| 部署复杂度 | 零（JVM 堆内存） | 需额外部署数据库/服务 |
-| 数据规模 | 15 条规范 × ~300 tokens | 百万级文档 |
-| 切换成本 | — | 改 1 行配置即可 |
-| 适用阶段 | MVP / 小团队 | 生产规模 |
+| 考量 | Milvus | SimpleVectorStore (旧) | PgVectorStore / Redis |
+|------|:---:|:---:|:---:|
+| 部署复杂度 | Docker 一条命令 | 零（JVM 堆内存） | 需额外部署 + 配置 |
+| 数据持久化 | ✅ 自动持久化到 MinIO | ❌ 重启即丢失 | ✅ |
+| 数据规模 | 百万级文档 | < 10,000 条 | 百万级文档 |
+| 检索速度 | AUTOINDEX 索引, < 10ms | 暴力全量, < 1ms | 近似最近邻, < 5ms |
+| 未来扩展 | 原生支持多向量/混合检索/RRF | 不支持 | 取决于实现 |
 
-团队规范文件仅有 6 大类 ~15 条规则，总字符数约 2000，切分后约 5-8 个 Document。这种规模下 `SimpleVectorStore` 已经足够 — 检索延迟 < 1ms，零运维成本。未来规模增长后，只需将 `RagConfig` 中的 Bean 切换为 `PgVectorStore.builder()` 或 `RedisVectorStore.builder()`，业务代码零改动。
+当前团队规范文件虽小（6 大类 ~15 条规则），但选择 Milvus 作为基础架构是 **面向增长决策**：
+- **持久化**：Milvus 数据存储在 MinIO 中，应用重启无需重新 Embedding
+- **扩展路径清晰**：未来可在当前 Collection 上增加 sparse 向量字段，启用混合检索 + RRF，无需重建数据
+- **运维成本可控**：开发环境 `docker compose up -d` 一条命令即可；生产环境可无缝迁移到 Milvus Cloud / Zilliz Cloud
 
 ---
 
@@ -405,7 +483,7 @@ AI 代码审查最大的挑战不是"没发现问题"，而是"发现了不存�
 **2. ✅ 滑动窗口 + 重叠分片 + 虚拟线程并行 — 已完成**
 **3. ✅ RAG 检索增强生成 — 已完成**
 
-~~当前 Prompt 中的审查规则是通用型的~~ → 已实现：团队规范 Markdown → `TokenTextSplitter` 切分 → `SimpleVectorStore` + 硅基流动 Embedding 向量化 → Diff Chunk 前 500 字符作为 Query 进行相似度检索 (topK=3) → 动态注入 Prompt `{teamConventions}` 占位符。详见设计思路第三节。
+~~当前 Prompt 中的审查规则是通用型的~~ → 已实现：团队规范 Markdown → `TokenTextSplitter` 切分 → `MilvusVectorStore` (AUTOINDEX + COSINE) + 硅基流动 Embedding 向量化 → Diff Chunk 前 500 字符作为 Query 进行相似度检索 (topK=3) → 动态注入 Prompt `{teamConventions}` 占位符。详见设计思路第三节。
 
 **4. 语义分片 (AST-aware Chunking)**
 
@@ -414,6 +492,10 @@ AI 代码审查最大的挑战不是"没发现问题"，而是"发现了不存�
 **5. 历史 Review 学习**
 
 将每次人工采纳/拒绝 AI 建议的反馈记录下来，形成标注数据集。通过 LoRA 微调或 Prompt 中提供 few-shot 示例，让模型学习特定团队的 Review 偏好，逐步降低误报率。
+
+**6. RRF 混合检索 (Reciprocal Rank Fusion)**
+
+当前 RAG 仅使用稠密向量（Dense Embedding）进行语义相似度检索，对特定术语（如 "SQL 注入"、"Controller 层"）的精确匹配不够敏感。Milvus 2.4 原生支持多向量字段（Sparse + Dense），下一步可引入 BM25 稀疏向量检索作为补充，通过 RRF 算法融合两种检索结果，在不损失语义泛化能力的前提下提升对团队规范中关键词的召回精度。
 
 **7. IDE 插件化**
 

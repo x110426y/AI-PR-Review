@@ -1,12 +1,14 @@
 package org.fourerif.config;
 
+import io.milvus.client.MilvusServiceClient;
+import io.milvus.param.ConnectParam;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
-import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.milvus.MilvusVectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Bean;
@@ -16,43 +18,67 @@ import org.springframework.core.io.Resource;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
- * RAG (检索增强生成) 配置。
+ * RAG（检索增强生成）配置 —— 本地 Milvus Standalone 版。
  * <p>
- * 使用 Spring AI 内存向量库 {@link SimpleVectorStore} 存储团队代码规范，
- * 在 AI 审查时通过相似度检索将最相关的规范注入 Prompt，使审查结果贴合团队实际标准。
+ * 手动创建 {@link MilvusServiceClient} 和 {@link MilvusVectorStore} Bean，
+ * 绕过 Spring AI 自动配置的属性命名空间差异。
+ * 本地 Docker 部署无需认证 token，连接地址固定为 localhost:19530。
  * <p>
- * <b>为什么选择 SimpleVectorStore？</b>
- * MVP 阶段无需引入 Redis / Milvus / pgvector 等外部向量数据库。
- * {@code SimpleVectorStore} 将所有向量数据保存在 JVM 堆内存中，
- * 对于团队规范这种小规模、低频更新场景完全足够。
- * 未来规模增长后可无缝切换至 {@code PgVectorStore} 或 {@code RedisVectorStore}。
+ * 启动时自动加载团队编码规范文档，切分为语义片段后写入 Milvus 向量库。
  */
 @Configuration
 public class RagConfig {
 
     private static final Logger log = LoggerFactory.getLogger(RagConfig.class);
 
+    // ==================== Milvus 连接参数（本地部署，无需 token）====================
+
+    @Value("${spring.vectorstore.milvus.uri:http://localhost:19530}")
+    private String milvusUri;
+
+    // ==================== Bean 定义 ====================
+
     /**
-     * 创建内存向量库 Bean（Builder 模式，Spring AI 1.0.0-M5+ 推荐写法）。
-     * <p>
-     * {@link EmbeddingModel} 由 {@code spring-ai-openai-spring-boot-starter} 自动配置，
-     * 使用 {@code application.yml} 中配置的 Embedding 模型。
+     * 创建 MilvusServiceClient，连接本地 Docker Milvus Standalone。
+     * 本地部署无需 token 认证，仅需 gRPC 地址。
      */
     @Bean
-    public VectorStore vectorStore(EmbeddingModel embeddingModel) {
-        log.info("初始化 SimpleVectorStore (内存向量库)，Embedding 模型: {}",
-                embeddingModel.getClass().getSimpleName());
-        return SimpleVectorStore.builder(embeddingModel).build();
+    public MilvusServiceClient milvusServiceClient() {
+        log.info("正在连接本地 Milvus Standalone: {}", milvusUri);
+
+        ConnectParam.Builder builder = ConnectParam.newBuilder()
+                .withUri(milvusUri)
+                .withConnectTimeout(15, TimeUnit.SECONDS)
+                .withIdleTimeout(60, TimeUnit.SECONDS);
+
+        MilvusServiceClient client = new MilvusServiceClient(builder.build());
+        log.info("MilvusServiceClient 已就绪（本地 Standalone，无认证）");
+        return client;
     }
 
     /**
-     * 应用启动时加载团队规范文件，切分为文档片段后写入向量库。
-     * <p>
-     * 切分策略：使用 {@link TokenTextSplitter} 按语义边界将 Markdown 规范文件
-     * 切分为多个独立的 Document。每个规范条目成为一个独立的检索单元，
-     * 确保相似度检索时能精确定位到最相关的规则。
+     * 创建 MilvusVectorStore。
+     * 依赖 {@code initializeSchema=true} 让 Spring AI 在启动时自动建表。
+     * 本地环境无集合数量限制，无需手动干预。
+     */
+    @Bean
+    public VectorStore vectorStore(MilvusServiceClient milvusClient, EmbeddingModel embeddingModel) {
+        log.info("初始化 MilvusVectorStore (Collection: team_conventions, Dim: 1024)");
+        return MilvusVectorStore.builder(milvusClient, embeddingModel)
+                .collectionName("team_conventions")
+                .databaseName("default")
+                .embeddingDimension(1024)
+                .initializeSchema(true)
+                .build();
+    }
+
+    // ==================== 数据加载 ====================
+
+    /**
+     * 应用启动时加载团队规范文件，切分后写入 Milvus。
      */
     @Bean
     ApplicationRunner initVectorStore(VectorStore vectorStore,
@@ -61,23 +87,16 @@ public class RagConfig {
             log.info("正在加载团队规范文件...");
             String content = conventionsResource.getContentAsString(StandardCharsets.UTF_8);
 
-            // 使用 TokenTextSplitter 切分文档（按语义段落，每个 Chunk ≈ 300 tokens）
             TokenTextSplitter splitter = new TokenTextSplitter(
-                    300,    // defaultChunkSize: 每个文档片段约 300 tokens（约 200-300 中文字符）
-                    50,     // minChunkSizeChars: 不创建小于 50 字符的片段
-                    20,     // minChunkLengthToEmbed: 片段至少 20 字符才入库
-                    50,     // maxNumChunks: 最多切分为 50 个片段
-                    true    // keepSeparator: 保留分隔符保持上下文完整
-            );
+                    300, 50, 20, 50, true);
 
             Document sourceDoc = new Document(content,
                     Map.of("source", "team-conventions.md", "type", "coding-standard"));
             List<Document> chunks = splitter.apply(List.of(sourceDoc));
 
-            // 写入向量库（自动 Embedding + 索引）
             vectorStore.add(chunks);
 
-            log.info("团队规范加载完成: 原始 {} 字符 → {} 个文档片段已向量化入库",
+            log.info("团队规范加载完成: 原始 {} 字符 → {} 个文档片段已写入 Milvus",
                     content.length(), chunks.size());
         };
     }
