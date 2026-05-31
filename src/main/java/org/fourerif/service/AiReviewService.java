@@ -7,6 +7,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.converter.BeanOutputConverter;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
@@ -24,6 +27,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * AI Review 服务 — 核心业务逻辑层。
@@ -41,17 +45,27 @@ public class AiReviewService {
     private static final Logger log = LoggerFactory.getLogger(AiReviewService.class);
 
     private final ChatClient chatClient;
+    private final VectorStore vectorStore;
     private final String promptTemplate;
 
+    /** 检索团队规范时的 Top-K 参数 — 返回最相关的 K 条规范 */
+    private static final int TOP_K_CONVENTIONS = 3;
+
+    /** 检索查询词的最大长度（取 Diff Chunk 前 N 个字符），避免过长查询稀释语义 */
+    private static final int QUERY_MAX_LENGTH = 500;
+
     /**
-     * 构造函数注入 ChatClient.Builder 和 Prompt 模板资源。
+     * 构造函数注入 ChatClient.Builder、VectorStore 和 Prompt 模板资源。
      *
      * @param chatClientBuilder Spring AI 自动配置的 ChatClient.Builder
+     * @param vectorStore       内存向量库（含已向量化的团队规范）
      * @param promptResource    从 classpath:prompts/review-prompt.st 加载的模板文件
      */
     public AiReviewService(ChatClient.Builder chatClientBuilder,
+                           VectorStore vectorStore,
                            @Value("classpath:prompts/review-prompt.st") Resource promptResource) throws IOException {
         this.chatClient = chatClientBuilder.build();
+        this.vectorStore = vectorStore;
         this.promptTemplate = promptResource.getContentAsString(StandardCharsets.UTF_8);
         log.info("AI Review Service 初始化完成，Prompt 模板已加载 ({} 字符)", promptTemplate.length());
     }
@@ -67,13 +81,17 @@ public class AiReviewService {
     public ReviewResult review(String prTitle, String prDescription, String diffContent) {
         log.info("开始 AI Review 分析...");
 
-        // 1. 创建 BeanOutputConverter，用于强制大模型输出符合 ReviewResult 结构的 JSON
+        // 1. RAG 检索：从向量库中查找与本 Chunk 最相关的团队规范
+        String teamConventions = retrieveTeamConventions(diffContent);
+
+        // 2. 创建 BeanOutputConverter，用于强制大模型输出符合 ReviewResult 结构的 JSON
         BeanOutputConverter<ReviewResult> converter = new BeanOutputConverter<>(ReviewResult.class);
 
-        // 2. 构建 User Message：Prompt 模板填充 + JSON Schema 格式约束
-        String userMessage = buildUserMessage(prTitle, prDescription, diffContent, converter);
+        // 3. 构建 User Message：Prompt 模板填充 + 团队规范 + JSON Schema 格式约束
+        String userMessage = buildUserMessage(prTitle, prDescription, diffContent,
+                teamConventions, converter);
 
-        // 3. 调用大模型
+        // 4. 调用大模型
         long startTime = System.currentTimeMillis();
         String aiResponse = chatClient.prompt()
                 .user(userMessage)
@@ -83,7 +101,7 @@ public class AiReviewService {
         log.info("AI 响应完成，耗时 {} ms，响应长度 {} 字符", elapsed,
                 aiResponse != null ? aiResponse.length() : 0);
 
-        // 4. 将 AI 返回的 JSON 转换为 ReviewResult 实体
+        // 5. 将 AI 返回的 JSON 转换为 ReviewResult 实体
         ReviewResult result = converter.convert(aiResponse);
         log.info("Review 结果解析成功: summary 长度={}, risks 数量={}, suggestions 数量={}",
                 result.summary() != null ? result.summary().length() : 0,
@@ -108,10 +126,13 @@ public class AiReviewService {
     public Flux<String> reviewStream(String prTitle, String prDescription, String diffContent) {
         log.info("开始 AI Review 流式分析...");
 
+        String teamConventions = retrieveTeamConventions(diffContent);
         BeanOutputConverter<ReviewResult> converter = new BeanOutputConverter<>(ReviewResult.class);
-        String userMessage = buildUserMessage(prTitle, prDescription, diffContent, converter);
+        String userMessage = buildUserMessage(prTitle, prDescription, diffContent,
+                teamConventions, converter);
 
-        log.info("流式请求已发送，等待模型逐 Token 输出...");
+        log.info("流式请求已发送 (含{}条团队规范)，等待模型逐 Token 输出...",
+                teamConventions.isBlank() ? 0 : "相关");
         return chatClient.prompt()
                 .user(userMessage)
                 .stream()
@@ -319,18 +340,88 @@ public class AiReviewService {
     }
 
     /**
-     * 拼装完整的 User Message：Prompt 模板 + JSON Schema 格式要求。
+     * 拼装完整的 User Message：Prompt 模板 + 团队规范 + JSON Schema 格式要求。
      * <p>
      * BeanOutputConverter.getFormat() 会生成类似 JSON Schema 的格式约束文本，
      * 附加在 Prompt 末尾可以有效引导大模型输出符合结构的 JSON。
      */
     private String buildUserMessage(String prTitle, String prDescription,
-                                     String diffContent, BeanOutputConverter<ReviewResult> converter) {
+                                     String diffContent, String teamConventions,
+                                     BeanOutputConverter<ReviewResult> converter) {
+        // 规范为空时填入提示语，避免占位符残留
+        String conventionsText = (teamConventions != null && !teamConventions.isBlank())
+                ? teamConventions
+                : "（无额外团队规范约束，按通用最佳实践审查）";
+
         return promptTemplate
                 .replace("{prTitle}", prTitle != null ? prTitle : "无")
                 .replace("{prDescription}", prDescription != null ? prDescription : "无描述")
                 .replace("{diffContent}", diffContent != null ? diffContent : "（无变更内容）")
+                .replace("{teamConventions}", conventionsText)
                 + "\n\n--- 输出格式要求（严格遵守 JSON Schema）---\n"
                 + converter.getFormat();
+    }
+
+    // ==================== RAG 检索逻辑 ====================
+
+    /**
+     * 从向量库中检索与当前 Diff Chunk 最相关的团队规范。
+     * <p>
+     * <b>Query 构造策略：</b>
+     * 使用 Diff Chunk 的前 {@link #QUERY_MAX_LENGTH} 个字符作为查询词。
+     * <p>
+     * <b>理由：</b>
+     * Unified Diff 格式的开头部分包含最关键的结构化信息：
+     * <ol>
+     *   <li>文件路径（{@code diff --git a/Xxx.java b/Xxx.java}）— 表明涉及的模块</li>
+     *   <li>变更位置（{@code @@ -10,6 +10,15 @@}）— 定位改动的类/方法</li>
+     *   <li>上下文代码 — 提供足够的语义线索</li>
+     * </ol>
+     * 截取前 500 字符足以覆盖这些信息，同时避免过长查询稀释向量相似度的精度。
+     * <p>
+     * <b>备选方案比较：</b>
+     * <ul>
+     *   <li>PR 标题作为 Query：维度太高，缺少代码级语义</li>
+     *   <li>完整 Diff 作为 Query：过长，Embedding 模型可能截断或稀释关键信息</li>
+     *   <li>随机采样行：可能丢失文件路径等核心元信息</li>
+     * </ul>
+     *
+     * @param diffContent Diff Chunk 文本
+     * @return 格式化后的团队规范文本；若向量库为空或检索失败，返回空字符串
+     */
+    private String retrieveTeamConventions(String diffContent) {
+        try {
+            // 提取 Query：取 Diff 前 N 个字符
+            String query = diffContent != null && diffContent.length() > QUERY_MAX_LENGTH
+                    ? diffContent.substring(0, QUERY_MAX_LENGTH)
+                    : (diffContent != null ? diffContent : "");
+
+            if (query.isBlank()) {
+                return "";
+            }
+
+            // 向量相似度检索
+            List<Document> results = vectorStore.similaritySearch(
+                    SearchRequest.query(query).withTopK(TOP_K_CONVENTIONS));
+
+            if (results == null || results.isEmpty()) {
+                log.debug("未检索到相关团队规范");
+                return "";
+            }
+
+            // 组装规范文本
+            String conventions = results.stream()
+                    .map(Document::getContent)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.joining("\n\n"));
+
+            log.debug("检索到 {} 条相关团队规范 (Query 长度: {} 字符)", results.size(), query.length());
+            return conventions;
+
+        } catch (Exception e) {
+            // 检索失败不应中断主流程 — 降级为无规范约束
+            log.warn("团队规范检索失败，本次审查将不注入规范约束: {}", e.getMessage());
+            return "";
+        }
     }
 }

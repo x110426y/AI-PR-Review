@@ -2,7 +2,7 @@ spring:
   application:
     name: ai-pr-review
 
-  # ==================== AI 配置 (DeepSeek) ====================
+  # ==================== AI 配置 (DeepSeek + Embedding) ====================
   ai:
     openai:
       api-key: ${DEEPSEEK_API_KEY:YOUR-API-KEY}       # DeepSeek API 密钥，通过环境变量注入
@@ -12,9 +12,22 @@ spring:
           model: ${DEEPSEEK_MODEL:deepseek-v4-flash}                     # deepseek-chat (V3) 或 deepseek-reasoner (R1)
           temperature: 0.3                                            # 较低的温度确保输出更一致、更少"幻觉"
 
+      # ---------- Embedding 向量化配置 (硅基流动，供 RAG 向量检索使用) ----------
+      embedding:
+        # 硅基流动独立 API Key（与 DeepSeek 分离）
+        api-key: ${SILICONFLOW_API_KEY:YOUR-API-KEY}
+        # 硅基流动兼容 OpenAI 接口格式
+        base-url: https://api.siliconflow.cn
+        options:
+          # 硅基流动推荐的中文 Embedding 模型：
+          #   BAAI/bge-large-zh-v1.5  — 1024 维，中文效果最佳，免费
+          #   BAAI/bge-m3              — 1024 维，中英双语，支持 8192 tokens 输入
+          #   netease-youdao/bce-embedding-base_v1 — 768 维，轻量
+          model: ${EMBEDDING_MODEL:BAAI/bge-large-zh-v1.5}
+
 # ==================== GitHub 配置 ====================
 github:
-  token: ${GITHUB_TOKEN:GITHUB-TOKEN}                   # GitHub Personal Access Token，通过环境变量注入
+  token: ${GITHUB_TOKEN:YOUR-KEY}                   # GitHub Personal Access Token，通过环境变量注入
   api:
     base-url: https://api.github.com                              # GitHub API 基础地址
 
