@@ -402,7 +402,10 @@ public class AiReviewService {
 
             // 向量相似度检索
             List<Document> results = vectorStore.similaritySearch(
-                    SearchRequest.query(query).withTopK(TOP_K_CONVENTIONS));
+                    SearchRequest.builder()
+                            .query(query)
+                            .topK(TOP_K_CONVENTIONS)
+                            .build());
 
             if (results == null || results.isEmpty()) {
                 log.debug("未检索到相关团队规范");
@@ -411,7 +414,7 @@ public class AiReviewService {
 
             // 组装规范文本
             String conventions = results.stream()
-                    .map(Document::getContent)
+                    .map(Document::getText)
                     .filter(Objects::nonNull)
                     .collect(Collectors.joining("\n\n"));
 
