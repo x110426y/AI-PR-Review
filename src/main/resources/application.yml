@@ -5,7 +5,7 @@ spring:
   # ==================== AI 配置 (DeepSeek) ====================
   ai:
     openai:
-      api-key: ${DEEPSEEK_API_KEY:YOUR_DEEPSEEK_API}       # DeepSeek API 密钥，通过环境变量注入
+      api-key: ${DEEPSEEK_API_KEY:YOUR-API-KEY}       # DeepSeek API 密钥，通过环境变量注入
       base-url: https://api.deepseek.com                             # DeepSeek 兼容 OpenAI 接口格式
       chat:
         options:
@@ -14,7 +14,7 @@ spring:
 
 # ==================== GitHub 配置 ====================
 github:
-  token: ${GITHUB_TOKEN:GITHUB_TOKEN}                   # GitHub Personal Access Token，通过环境变量注入
+  token: ${GITHUB_TOKEN:GITHUB-TOKEN}                   # GitHub Personal Access Token，通过环境变量注入
   api:
     base-url: https://api.github.com                              # GitHub API 基础地址
 
