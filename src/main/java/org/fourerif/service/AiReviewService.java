@@ -7,9 +7,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.converter.BeanOutputConverter;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
@@ -27,7 +24,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 
 /**
  * AI Review 服务 — 核心业务逻辑层。
@@ -45,7 +41,7 @@ public class AiReviewService {
     private static final Logger log = LoggerFactory.getLogger(AiReviewService.class);
 
     private final ChatClient chatClient;
-    private final VectorStore vectorStore;
+    private final MilvusHybridService milvusHybridService;
     private final String promptTemplate;
 
     /** 检索团队规范时的 Top-K 参数 — 返回最相关的 K 条规范 */
@@ -55,19 +51,20 @@ public class AiReviewService {
     private static final int QUERY_MAX_LENGTH = 500;
 
     /**
-     * 构造函数注入 ChatClient.Builder、VectorStore 和 Prompt 模板资源。
+     * 构造函数注入 ChatClient.Builder、MilvusHybridService 和 Prompt 模板资源。
      *
-     * @param chatClientBuilder Spring AI 自动配置的 ChatClient.Builder
-     * @param vectorStore       内存向量库（含已向量化的团队规范）
-     * @param promptResource    从 classpath:prompts/review-prompt.st 加载的模板文件
+     * @param chatClientBuilder     Spring AI 自动配置的 ChatClient.Builder
+     * @param milvusHybridService   混合检索服务（Dense + Sparse + RRF）
+     * @param promptResource        从 classpath:prompts/review-prompt.st 加载的模板文件
      */
     public AiReviewService(ChatClient.Builder chatClientBuilder,
-                           VectorStore vectorStore,
+                           MilvusHybridService milvusHybridService,
                            @Value("classpath:prompts/review-prompt.st") Resource promptResource) throws IOException {
         this.chatClient = chatClientBuilder.build();
-        this.vectorStore = vectorStore;
+        this.milvusHybridService = milvusHybridService;
         this.promptTemplate = promptResource.getContentAsString(StandardCharsets.UTF_8);
-        log.info("AI Review Service 初始化完成，Prompt 模板已加载 ({} 字符)", promptTemplate.length());
+        log.info("AI Review Service 初始化完成，Prompt 模板已加载 ({} 字符) —— Hybrid Search + RRF 已就绪",
+                promptTemplate.length());
     }
 
     /**
@@ -362,32 +359,24 @@ public class AiReviewService {
                 + converter.getFormat();
     }
 
-    // ==================== RAG 检索逻辑 ====================
+    // ==================== RAG 检索逻辑 (Hybrid Search + RRF) ====================
 
     /**
-     * 从向量库中检索与当前 Diff Chunk 最相关的团队规范。
+     * 从 Milvus 中通过 Dense + Sparse 双路 RRF 混合检索团队规范。
      * <p>
      * <b>Query 构造策略：</b>
-     * 使用 Diff Chunk 的前 {@link #QUERY_MAX_LENGTH} 个字符作为查询词。
+     * 使用 Diff Chunk 的前 {@link #QUERY_MAX_LENGTH} 个字符作为查询词 —
+     * Unified Diff 格式的开头包含文件路径 + 变更位置 + 首段代码，语义密度最高。
      * <p>
-     * <b>理由：</b>
-     * Unified Diff 格式的开头部分包含最关键的结构化信息：
-     * <ol>
-     *   <li>文件路径（{@code diff --git a/Xxx.java b/Xxx.java}）— 表明涉及的模块</li>
-     *   <li>变更位置（{@code @@ -10,6 +10,15 @@}）— 定位改动的类/方法</li>
-     *   <li>上下文代码 — 提供足够的语义线索</li>
-     * </ol>
-     * 截取前 500 字符足以覆盖这些信息，同时避免过长查询稀释向量相似度的精度。
-     * <p>
-     * <b>备选方案比较：</b>
+     * <b>两路检索的分工：</b>
      * <ul>
-     *   <li>PR 标题作为 Query：维度太高，缺少代码级语义</li>
-     *   <li>完整 Diff 作为 Query：过长，Embedding 模型可能截断或稀释关键信息</li>
-     *   <li>随机采样行：可能丢失文件路径等核心元信息</li>
+     *   <li><b>Dense 路 (COSINE)</b>：捕获语义相似性 — "这个改动和 SQL 注入规范有关"</li>
+     *   <li><b>Sparse 路 (BM25+IP)</b>：捕获关键词精确匹配 — "这段代码包含 'Statement.executeQuery'"</li>
+     *   <li><b>RRF (k=60)</b>：排名融合 — 两种检索信号交叉验证，同时被两路排前面的规范获胜</li>
      * </ul>
      *
      * @param diffContent Diff Chunk 文本
-     * @return 格式化后的团队规范文本；若向量库为空或检索失败，返回空字符串
+     * @return 格式化后的团队规范文本；若检索失败，返回空字符串（降级为无规范审查）
      */
     private String retrieveTeamConventions(String diffContent) {
         try {
@@ -400,30 +389,24 @@ public class AiReviewService {
                 return "";
             }
 
-            // 向量相似度检索
-            List<Document> results = vectorStore.similaritySearch(
-                    SearchRequest.builder()
-                            .query(query)
-                            .topK(TOP_K_CONVENTIONS)
-                            .build());
+            // === Hybrid Search (Dense + Sparse + RRF) ===
+            List<String> results = milvusHybridService.hybridSearch(query, TOP_K_CONVENTIONS);
 
             if (results == null || results.isEmpty()) {
-                log.debug("未检索到相关团队规范");
+                log.debug("Hybrid Search 未检索到相关团队规范");
                 return "";
             }
 
-            // 组装规范文本
-            String conventions = results.stream()
-                    .map(Document::getText)
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.joining("\n\n"));
+            // 组装规范文本（每个 result 即为一个规范片段的完整文本）
+            String conventions = String.join("\n\n", results);
 
-            log.debug("检索到 {} 条相关团队规范 (Query 长度: {} 字符)", results.size(), query.length());
+            log.debug("Hybrid Search 检索到 {} 条相关团队规范 (Query 长度: {} 字符)",
+                    results.size(), query.length());
             return conventions;
 
         } catch (Exception e) {
             // 检索失败不应中断主流程 — 降级为无规范约束
-            log.warn("团队规范检索失败，本次审查将不注入规范约束: {}", e.getMessage());
+            log.warn("Hybrid Search 失败，本次审查将不注入规范约束: {}", e.getMessage());
             return "";
         }
     }
