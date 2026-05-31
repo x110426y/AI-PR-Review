@@ -86,6 +86,7 @@ function startReview() {
     streamText.value += e.data
   }
 
+
   // 流结束 — 停止计时，解析 JSON，渲染结构化卡片
   eventSource.addEventListener('done', () => {
     eventSource.close()

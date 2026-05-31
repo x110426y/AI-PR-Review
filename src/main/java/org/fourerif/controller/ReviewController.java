@@ -1,5 +1,6 @@
 package org.fourerif.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.fourerif.dto.ReviewResult;
 import org.fourerif.service.AiReviewService;
 import org.fourerif.service.GitHubService;
@@ -17,6 +18,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
 
 import java.io.IOException;
+import java.util.List;
 
 /**
  * PR Review REST 控制器。
@@ -34,10 +36,13 @@ public class ReviewController {
 
     private final GitHubService gitHubService;
     private final AiReviewService aiReviewService;
+    private final ObjectMapper objectMapper;
 
-    public ReviewController(GitHubService gitHubService, AiReviewService aiReviewService) {
+    public ReviewController(GitHubService gitHubService, AiReviewService aiReviewService,
+                            ObjectMapper objectMapper) {
         this.gitHubService = gitHubService;
         this.aiReviewService = aiReviewService;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -50,24 +55,31 @@ public class ReviewController {
     public ResponseEntity<?> review(@RequestParam("prUrl") String prUrl) {
         log.info("收到 Review 请求: prUrl={}", prUrl);
 
-        // 1. 解析 PR URL，提取 owner、repo、prNumber
+        // 1. 解析 PR URL
         ParsedPrUrl parsed = gitHubService.parsePrUrl(prUrl)
                 .orElseThrow(() -> {
                     log.warn("无效的 PR URL: {}", prUrl);
                     return new IllegalArgumentException("无效的 GitHub PR URL，格式应为: https://github.com/{owner}/{repo}/pull/{number}");
                 });
 
-        // 2. 获取 PR 基本信息（标题、描述）
+        // 2. 获取 PR 基本信息
         PrInfo prInfo = gitHubService.getPrInfo(parsed.owner(), parsed.repo(), parsed.prNumber());
         log.info("PR 信息: title={}", prInfo.title());
 
-        // 3. 获取 PR 的 Diff 内容
-        String diff = gitHubService.getPrDiff(parsed.owner(), parsed.repo(), parsed.prNumber());
+        // 3. 获取 Diff 并按滑动窗口分片
+        List<String> chunks = gitHubService.getPrDiffChunked(
+                parsed.owner(), parsed.repo(), parsed.prNumber());
 
-        // 4. 调用 AI 进行代码审查
-        ReviewResult result = aiReviewService.review(prInfo.title(), prInfo.description(), diff);
+        // 4. 单分片直接审查；多分片并行审查 + 聚合
+        ReviewResult result;
+        if (chunks.size() == 1) {
+            result = aiReviewService.review(prInfo.title(), prInfo.description(), chunks.get(0));
+        } else {
+            log.info("PR 过大，启动并行审查 ({} 个分片)...", chunks.size());
+            result = aiReviewService.reviewChunksParallel(
+                    prInfo.title(), prInfo.description(), chunks, null);
+        }
 
-        // 5. 返回结构化结果
         return ResponseEntity.ok(result);
     }
 
@@ -97,19 +109,31 @@ public class ReviewController {
                     return new IllegalArgumentException("无效的 GitHub PR URL，格式应为: https://github.com/{owner}/{repo}/pull/{number}");
                 });
 
-        // 2. 获取 PR 信息及 Diff（同步，需等待）
+        // 2. 获取 PR 信息及 Diff
         PrInfo prInfo = gitHubService.getPrInfo(parsed.owner(), parsed.repo(), parsed.prNumber());
         log.info("PR 信息: title={}", prInfo.title());
-        String diff = gitHubService.getPrDiff(parsed.owner(), parsed.repo(), parsed.prNumber());
+        List<String> chunks = gitHubService.getPrDiffChunked(
+                parsed.owner(), parsed.repo(), parsed.prNumber());
 
-        // 3. 创建 SseEmitter（120 秒超时，覆盖最长推理时间）
+        // 3. 单分片 → 逐 Token 流式推送（打字机体验）
+        if (chunks.size() == 1) {
+            return streamSingleChunk(prInfo, chunks.get(0));
+        }
+
+        // 4. 多分片 → 并行审查 + SSE 进度通知 + 最终一次性推送聚合 JSON
+        return streamMultiChunk(prInfo, chunks);
+    }
+
+    /**
+     * 单分片流式审查 — 逐 Token SSE 推送，保持打字机体验。
+     */
+    private SseEmitter streamSingleChunk(PrInfo prInfo, String chunk) {
         SseEmitter emitter = new SseEmitter(120_000L);
 
-        // 4. 异步启动 AI 流式调用，逐 Token 推送至客户端
         Thread.startVirtualThread(() -> {
             try {
                 Flux<String> tokenStream = aiReviewService.reviewStream(
-                        prInfo.title(), prInfo.description(), diff);
+                        prInfo.title(), prInfo.description(), chunk);
 
                 tokenStream
                         .doOnNext(token -> sendData(emitter, token))
@@ -129,10 +153,53 @@ public class ReviewController {
             }
         });
 
-        // 5. 注册超时和错误回调
-        emitter.onTimeout(() -> log.warn("SSE 连接超时: prUrl={}", prUrl));
+        emitter.onTimeout(() -> log.warn("SSE 连接超时"));
         emitter.onError(ex -> log.error("SSE 推送异常", ex));
+        return emitter;
+    }
 
+    /**
+     * 多分片并行审查 — SSE 推送进度事件，完成后一次性推送聚合 JSON。
+     * <p>
+     * 事件序列：
+     * <ol>
+     *   <li>{@code event: info \n data: {"chunks":N}} — 分片总数</li>
+     *   <li>{@code event: progress \n data: 分片审查已完成 X/N} — 每完成一个分片触发一次</li>
+     *   <li>{@code data: <聚合后的 JSON>} — 最终结果（无名事件，由 onmessage 接收）</li>
+     *   <li>{@code event: done \n data: complete} — 流结束</li>
+     * </ol>
+     */
+    private SseEmitter streamMultiChunk(PrInfo prInfo, List<String> chunks) {
+        int total = chunks.size();
+        log.info("多分片并行审查: {} 个分片", total);
+
+        SseEmitter emitter = new SseEmitter(300_000L);   // 5 分钟超时
+
+        Thread.startVirtualThread(() -> {
+            try {
+                // 发送分片总数
+                sendNamedEvent(emitter, "info", "{\"chunks\":" + total + "}");
+
+                // 并行审查，每完成一个分片推送进度
+                ReviewResult result = aiReviewService.reviewChunksParallel(
+                        prInfo.title(), prInfo.description(), chunks,
+                        progressMsg -> sendNamedEvent(emitter, "progress", progressMsg)
+                );
+
+                // 推送聚合后的最终 JSON
+                String json = objectMapper.writeValueAsString(result);
+                sendData(emitter, json);
+                sendDone(emitter);
+                emitter.complete();
+                log.info("多分片审查完成，聚合结果已推送");
+            } catch (Exception e) {
+                log.error("多分片审查失败", e);
+                emitter.completeWithError(e);
+            }
+        });
+
+        emitter.onTimeout(() -> log.warn("多分片 SSE 连接超时: {} 个分片", total));
+        emitter.onError(ex -> log.error("多分片 SSE 推送异常", ex));
         return emitter;
     }
 
@@ -155,6 +222,18 @@ public class ReviewController {
             emitter.send(SseEmitter.event().name("done").data("complete"));
         } catch (IOException e) {
             log.debug("SSE 客户端已断开");
+        }
+    }
+
+    /**
+     * 发送命名事件（如 progress、info），仅在前端显式监听时接收，
+     * 不会污染 onmessage 的 JSON 累积流。
+     */
+    private void sendNamedEvent(SseEmitter emitter, String eventName, String data) {
+        try {
+            emitter.send(SseEmitter.event().name(eventName).data(data));
+        } catch (IOException e) {
+            log.debug("SSE 客户端已断开，停止推送");
         }
     }
 }
